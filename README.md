@@ -21,8 +21,7 @@ Messages and room name are persisted to a local JSON file:
 
 Messages do not auto-expire.
 
-## Admin Authentication
-Admin access is granted to the roll number `250252780057`.
+
 
 ## Local Run
 ### Server
