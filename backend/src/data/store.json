@@ -1,0 +1,19 @@
+{
+  "rooms": {
+    "MSc": {
+      "name": "MSc",
+      "ownerRegistrationNo": "250252780014",
+      "messages": [],
+      "anonRegistry": {
+        "Ghost-97": {
+          "registrationNo": "250252780014",
+          "name": "GURDEEP SINGH"
+        },
+        "Ghost-14": {
+          "registrationNo": "250252780014",
+          "name": "GURDEEP SINGH"
+        }
+      }
+    }
+  }
+}

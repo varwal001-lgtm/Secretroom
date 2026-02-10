@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  background: radial-gradient(circle at 20% 10%, rgba(34, 211, 238, 0.12), transparent 42%),
+    radial-gradient(circle at 80% 0%, rgba(14, 116, 144, 0.2), transparent 40%),
+    radial-gradient(circle at 10% 80%, rgba(99, 102, 241, 0.12), transparent 45%),
+    #0b0f14;
+  min-height: 100vh;
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif, "Apple Color Emoji",
+    "Segoe UI Emoji", "Noto Color Emoji";
+}
+
+input,
+textarea,
+button {
+  font-family: inherit;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #2a3547 #0f1117;
+}
+
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+*::-webkit-scrollbar-track {
+  background: #0f1117;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: #2a3547;
+  border-radius: 999px;
+}
+
+.card-glow {
+  box-shadow: 0 0 30px rgba(34, 211, 238, 0.2);
+}
+
+.fade-in {
+  animation: fadeIn 0.6s ease both;
+}
+
+.flash-digit {
+  animation: flashDigits 0.6s ease-in-out infinite alternate;
+}
+
+@keyframes flashDigits {
+  from {
+    opacity: 0.4;
+    transform: scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1.02);
+  }
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+emoji-picker {
+  --background: #111827;
+  --border-color: rgba(148, 163, 184, 0.2);
+  --button-active-background: rgba(34, 211, 238, 0.15);
+  --button-hover-background: rgba(34, 211, 238, 0.12);
+  --input-border-color: rgba(148, 163, 184, 0.25);
+  --input-border-radius: 14px;
+  --category-icon-active-color: #22d3ee;
+  --category-icon-color: #9aa9bf;
+  --indicator-color: #22d3ee;
+  --outline-color: rgba(34, 211, 238, 0.4);
+  --text-color: #e5eef8;
+  --emoji-size: 24px;
+  width: min(320px, 90vw);
+  height: 360px;
+  border-radius: 16px;
+  box-shadow: 0 20px 60px rgba(3, 7, 18, 0.6);
+}
