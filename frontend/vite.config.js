@@ -1,1 +1,1 @@
-export default { base: '/bestroom/' } 
+export default { base: '/' }

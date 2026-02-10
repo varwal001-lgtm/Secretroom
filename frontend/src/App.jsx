@@ -1,13 +1,16 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import "emoji-picker-element";
 
-const API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
+const RAW_API_URL = import.meta.env.VITE_API_URL || "http://localhost:3001";
+const API_URL = RAW_API_URL.replace(/\/$/, "");
+const RAW_WS_URL = import.meta.env.VITE_WS_URL || "";
+const WS_URL = RAW_WS_URL
+  ? RAW_WS_URL.replace(/\/$/, "")
+  : API_URL.replace(/^https?:/, API_URL.startsWith("https") ? "wss:" : "ws:");
 
 function wsUrl() {
   try {
-    const url = new URL(API_URL);
-    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    return url.toString();
+    return WS_URL;
   } catch {
     return "ws://localhost:3001";
   }
