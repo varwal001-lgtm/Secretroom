@@ -231,6 +231,9 @@ export default function App() {
         body: JSON.stringify({ accessKey, deviceId }),
       });
       if (!res.ok) {
+        if (res.status === 404) {
+          throw new Error("Backend is not updated yet. Please deploy latest Render backend.");
+        }
         const data = await res.json().catch(() => ({}));
         throw new Error(data.error || "Could not enter room");
       }
