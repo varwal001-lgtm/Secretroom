@@ -1,18 +1,25 @@
 {
   "rooms": {
-    "MSc": {
-      "name": "MSc",
-      "ownerRegistrationNo": "250252780014",
-      "messages": [],
-      "anonRegistry": {
-        "Ghost-97": {
-          "registrationNo": "250252780014",
-          "name": "GURDEEP SINGH"
-        },
-        "Ghost-14": {
-          "registrationNo": "250252780014",
-          "name": "GURDEEP SINGH"
+    "Secret Room": {
+      "name": "Secret Room",
+      "messages": [
+        {
+          "id": "2a5becbc-7480-465a-86c8-e8a269a3bcf7",
+          "ts": 1771065528161,
+          "anonName": "Anon-6305",
+          "messageType": "text",
+          "content": "hey.",
+          "replyTo": null,
+          "reactions": {
+            "👍": [
+              "Anon-6305"
+            ]
+          }
         }
+      ],
+      "pinnedMessageId": null,
+      "typing": {
+        "Anon-6305": false
       }
     }
   }

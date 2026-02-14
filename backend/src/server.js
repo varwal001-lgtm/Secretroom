@@ -1,18 +1,16 @@
-﻿const http = require("http");
+const http = require("http");
 const crypto = require("crypto");
 const fs = require("fs");
 const path = require("path");
 const express = require("express");
 const cors = require("cors");
 const { WebSocketServer } = require("ws");
-const { STUDENTS, DEFAULT_DEPARTMENT } = require("./data/students");
 
 const PORT = process.env.PORT || 3001;
-const ADMIN_ROLL_NUMBER = "250252780057";
-const MAX_IMAGE_BYTES = 1_000_000; // ~1MB base64 payload size limit
-const MAX_AUDIO_BYTES = 2_000_000; // ~2MB base64 payload size limit
-const AUTH_WINDOW_MS = 15_000;
-const MESSAGE_TTL_MS = 60 * 60 * 1000;
+const ACCESS_KEY = process.env.ACCESS_KEY || "gjuaids";
+const DEFAULT_ROOM = "Secret Room";
+const MESSAGE_TTL_MS = 30 * 60 * 1000;
+const MAX_TEXT_BYTES = 2_000;
 
 const app = express();
 app.use(cors());
@@ -21,16 +19,10 @@ app.use(express.json({ limit: "5mb" }));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const studentsByReg = new Map(
-  STUDENTS.map((s) => [s.registrationNo, s])
-);
-
-const sessions = new Map(); // sessionId -> { registrationNo, name, department, anonName, isAdmin, deviceId }
+const sessions = new Map(); // sessionId -> { anonName, roomName, deviceId }
 const wsToSession = new Map(); // ws -> sessionId
-const roomClients = new Map(); // department -> Set(ws)
-const rooms = new Map(); // department -> { name, ownerSessionId, ownerRegistrationNo, messages: [] }
-const authChallenges = new Map(); // registrationNo -> { code, expiresAt } (5-second window)
-const activeSessions = new Map(); // registrationNo -> { sessionId, deviceId, lastSeen, activeWs }
+const roomClients = new Map(); // roomName -> Set(ws)
+const activeSessionByDevice = new Map(); // deviceId -> sessionId
 
 const STORE_PATH = path.join(__dirname, "data", "store.json");
 let storeCache = { rooms: {} };
@@ -61,66 +53,58 @@ function flushStore() {
 
 loadStore();
 
-function getOrCreateRoom(department) {
-  if (!rooms.has(department)) {
-    const persisted = storeCache.rooms[department];
-    rooms.set(department, {
-      name: persisted?.name || department || DEFAULT_DEPARTMENT,
-      ownerSessionId: null,
-      ownerRegistrationNo: persisted?.ownerRegistrationNo || null,
-      messages: persisted?.messages || [],
-      anonRegistry: persisted?.anonRegistry || {},
-    });
-  }
-  return rooms.get(department);
-}
-
-function generateAnonName(department) {
-  const room = getOrCreateRoom(department);
-  const reserved = new Set(Object.keys(room.anonRegistry || {}));
-  const label = Math.random() > 0.5 ? "User" : "Ghost";
-  let name;
-  do {
-    name = `${label}-${Math.floor(10 + Math.random() * 90)}`;
-  } while (
-    [...sessions.values()].some((s) => s.anonName === name) ||
-    reserved.has(name)
-  );
-  return name;
-}
-
 function now() {
   return Date.now();
 }
 
-function generateAuthCode() {
-  const value = crypto.randomInt(0, 1_000_000);
-  return String(value).padStart(6, "0");
+function getOrCreateRoom(roomName) {
+  if (!storeCache.rooms[roomName]) {
+    storeCache.rooms[roomName] = {
+      name: roomName,
+      messages: [],
+      pinnedMessageId: null,
+      typing: {},
+    };
+    markStoreDirty();
+  }
+  const room = storeCache.rooms[roomName];
+  if (!room.typing || typeof room.typing !== "object") {
+    room.typing = {};
+  }
+  return room;
+}
+
+function generateAnonName(roomName) {
+  const room = getOrCreateRoom(roomName);
+  const used = new Set(
+    (room.messages || []).map((message) => message.anonName).filter(Boolean)
+  );
+  for (const session of sessions.values()) {
+    if (session.roomName === roomName) {
+      used.add(session.anonName);
+    }
+  }
+
+  let name;
+  do {
+    name = `Anon-${Math.floor(1000 + Math.random() * 9000)}`;
+  } while (used.has(name));
+  return name;
 }
 
 function pruneMessages(room) {
   const cutoff = now() - MESSAGE_TTL_MS;
-  if (!room.messages.length) return;
-  room.messages = room.messages.filter((m) => m.ts >= cutoff);
-}
-
-function canUseRollNumber(registrationNo, deviceId) {
-  const active = activeSessions.get(registrationNo);
-  if (!active) return { ok: true };
-  if (active.deviceId === deviceId) return { ok: true };
-  if (active.activeWs > 0) {
-    return { ok: false, error: "Account already logged in on another device" };
+  const before = room.messages.length;
+  room.messages = room.messages.filter((message) => message.ts >= cutoff);
+  if (before !== room.messages.length) {
+    if (room.pinnedMessageId && !room.messages.some((m) => m.id === room.pinnedMessageId)) {
+      room.pinnedMessageId = null;
+    }
+    markStoreDirty();
   }
-  return { ok: false, error: "Account already logged in on another device" };
 }
 
-function persistRoom(department, room) {
-  storeCache.rooms[department] = {
-    name: room.name,
-    ownerRegistrationNo: room.ownerRegistrationNo,
-    messages: room.messages,
-    anonRegistry: room.anonRegistry || {},
-  };
+function persistRoom() {
   markStoreDirty();
 }
 
@@ -130,98 +114,79 @@ function send(ws, payload) {
   }
 }
 
-function broadcastToRoom(department, payload) {
-  const clients = roomClients.get(department);
+function broadcastToRoom(roomName, payload) {
+  const clients = roomClients.get(roomName);
   if (!clients) return;
   for (const ws of clients) {
     send(ws, payload);
   }
 }
 
-function getRoster(department) {
-  const roster = [];
-  for (const session of sessions.values()) {
-    if (session.department === department) {
-      roster.push(session.anonName);
-    }
-  }
-  return roster.sort();
+function toPublicMessage(entry) {
+  return {
+    id: entry.id,
+    ts: entry.ts,
+    anonName: entry.anonName,
+    messageType: "text",
+    content: entry.content,
+    replyTo: entry.replyTo || null,
+    reactions: entry.reactions || {},
+  };
 }
 
-app.post("/api/login", (req, res) => {
-  const { rollNumber, code, deviceId } = req.body || {};
-  const normalizedRoll = String(rollNumber || "").trim();
-  const student = studentsByReg.get(normalizedRoll);
+function buildSessionPayload(sessionId, session) {
+  return {
+    sessionId,
+    anonName: session.anonName,
+    roomName: session.roomName,
+  };
+}
 
-  if (!student) {
-    return res.status(401).json({ error: "Invalid roll number or code" });
-  }
+app.post("/api/enter", (req, res) => {
+  const { accessKey, deviceId } = req.body || {};
 
   if (!deviceId || typeof deviceId !== "string") {
     return res.status(400).json({ error: "Missing device ID" });
   }
 
-  const challenge = authChallenges.get(student.registrationNo);
-  if (!challenge || challenge.expiresAt < now()) {
-    return res.status(401).json({ error: "Authentication code expired" });
-  }
-  if (String(code || "").trim() !== challenge.code) {
-    return res.status(401).json({ error: "Invalid roll number or code" });
+  if (String(accessKey || "").trim() !== ACCESS_KEY) {
+    return res.status(401).json({ error: "Invalid private key" });
   }
 
-  const lockCheck = canUseRollNumber(student.registrationNo, deviceId);
-  if (!lockCheck.ok) {
-    return res.status(403).json({ error: lockCheck.error });
+  const room = getOrCreateRoom(DEFAULT_ROOM);
+  pruneMessages(room);
+
+  const existingSessionId = activeSessionByDevice.get(deviceId);
+  if (existingSessionId && sessions.has(existingSessionId)) {
+    const existingSession = sessions.get(existingSessionId);
+    return res.json(buildSessionPayload(existingSessionId, existingSession));
   }
 
   const sessionId = crypto.randomUUID();
-  let isAdmin = false;
-  if (student.registrationNo === ADMIN_ROLL_NUMBER) {
-    isAdmin = true;
-  }
-
-  const anonName = generateAnonName(student.department || DEFAULT_DEPARTMENT);
-
   const session = {
-    registrationNo: student.registrationNo,
-    name: student.name,
-    department: student.department || DEFAULT_DEPARTMENT,
-    anonName,
-    isAdmin: Boolean(isAdmin),
+    anonName: generateAnonName(DEFAULT_ROOM),
+    roomName: DEFAULT_ROOM,
     deviceId,
   };
 
   sessions.set(sessionId, session);
-  authChallenges.delete(student.registrationNo);
-  const existingActive = activeSessions.get(student.registrationNo);
-  if (existingActive && existingActive.sessionId !== sessionId) {
-    for (const [ws, sid] of wsToSession.entries()) {
-      if (sid === existingActive.sessionId) {
-        ws.close(1000, "Logged out");
-        wsToSession.delete(ws);
-      }
-    }
-  }
-  activeSessions.set(student.registrationNo, {
-    sessionId,
-    deviceId,
-    lastSeen: now(),
-    activeWs: 0,
-  });
-  const room = getOrCreateRoom(session.department);
-  room.anonRegistry[anonName] = {
-    registrationNo: session.registrationNo,
-    name: session.name,
-  };
-  persistRoom(session.department, room);
+  activeSessionByDevice.set(deviceId, sessionId);
 
-  return res.json({
-    sessionId,
-    anonName,
-    department: session.department,
-    roomName: rooms.get(session.department).name,
-    isAdmin: session.isAdmin,
-  });
+  return res.json(buildSessionPayload(sessionId, session));
+});
+
+app.post("/api/resume", (req, res) => {
+  const { sessionId, deviceId } = req.body || {};
+  if (!sessionId || !deviceId) {
+    return res.status(400).json({ error: "Missing session" });
+  }
+
+  const session = sessions.get(sessionId);
+  if (!session || session.deviceId !== deviceId) {
+    return res.status(401).json({ error: "Session expired" });
+  }
+
+  return res.json(buildSessionPayload(sessionId, session));
 });
 
 app.post("/api/logout", (req, res) => {
@@ -229,11 +194,8 @@ app.post("/api/logout", (req, res) => {
   if (sessionId && sessions.has(sessionId)) {
     const session = sessions.get(sessionId);
     sessions.delete(sessionId);
-    if (session) {
-      const active = activeSessions.get(session.registrationNo);
-      if (active && active.sessionId === sessionId) {
-        activeSessions.delete(session.registrationNo);
-      }
+    if (session && activeSessionByDevice.get(session.deviceId) === sessionId) {
+      activeSessionByDevice.delete(session.deviceId);
     }
     for (const [ws, sid] of wsToSession.entries()) {
       if (sid === sessionId) {
@@ -243,54 +205,6 @@ app.post("/api/logout", (req, res) => {
     }
   }
   return res.json({ ok: true });
-});
-
-app.post("/api/auth/challenge", (req, res) => {
-  const { rollNumber, deviceId } = req.body || {};
-  const normalizedRoll = String(rollNumber || "").trim();
-  const student = studentsByReg.get(normalizedRoll);
-
-  if (!student) {
-    return res.status(401).json({ error: "Invalid roll number" });
-  }
-  if (!deviceId || typeof deviceId !== "string") {
-    return res.status(400).json({ error: "Missing device ID" });
-  }
-
-  const lockCheck = canUseRollNumber(student.registrationNo, deviceId);
-  if (!lockCheck.ok) {
-    return res.status(403).json({ error: lockCheck.error });
-  }
-
-  const code = generateAuthCode();
-  const expiresAt = now() + AUTH_WINDOW_MS;
-  authChallenges.set(student.registrationNo, { code, expiresAt });
-
-  return res.json({ code, expiresAt });
-});
-
-app.post("/api/resume", (req, res) => {
-  const { sessionId, deviceId } = req.body || {};
-  if (!sessionId || !deviceId) {
-    return res.status(400).json({ error: "Missing session" });
-  }
-  const session = sessions.get(sessionId);
-  if (!session || session.deviceId !== deviceId) {
-    return res.status(401).json({ error: "Session expired" });
-  }
-
-  const active = activeSessions.get(session.registrationNo);
-  if (active) {
-    active.lastSeen = now();
-  }
-
-  return res.json({
-    sessionId,
-    anonName: session.anonName,
-    department: session.department,
-    roomName: rooms.get(session.department).name,
-    isAdmin: session.isAdmin,
-  });
 });
 
 wss.on("connection", (ws, req) => {
@@ -315,193 +229,141 @@ wss.on("connection", (ws, req) => {
     const session = sessions.get(sessionId);
     if (!session) return;
 
-    const active = activeSessions.get(session.registrationNo);
-    if (active) {
-      active.lastSeen = now();
-    }
-
-    const department = session.department;
-    const room = getOrCreateRoom(department);
+    const roomName = session.roomName;
+    const room = getOrCreateRoom(roomName);
 
     if (msg.type === "join") {
-      if (!roomClients.has(department)) {
-        roomClients.set(department, new Set());
+      if (!roomClients.has(roomName)) {
+        roomClients.set(roomName, new Set());
       }
-      roomClients.get(department).add(ws);
-
-      const active = activeSessions.get(session.registrationNo);
-      if (active) {
-        active.activeWs += 1;
-        active.lastSeen = now();
-      }
-
-      if (!room.ownerSessionId) {
-        room.ownerSessionId = sessionId;
-        if (!room.ownerRegistrationNo) {
-          room.ownerRegistrationNo = session.registrationNo;
-          persistRoom(department, room);
-        }
-      }
+      roomClients.get(roomName).add(ws);
 
       pruneMessages(room);
 
-      const publicMessages = room.messages.map((m) => ({
-        id: m.id,
-        ts: m.ts,
-        anonName: m.anonName,
-        messageType: m.messageType,
-        content: m.content,
-      }));
-
       send(ws, {
         type: "joined",
-        room: {
-          name: room.name,
-          canRename:
-            room.ownerSessionId === sessionId ||
-            room.ownerRegistrationNo === session.registrationNo,
-        },
-        roster: getRoster(department),
-        messages: publicMessages,
-        you: {
-          anonName: session.anonName,
-          department: session.department,
-          isAdmin: session.isAdmin,
-        },
+        room: { name: room.name || roomName, canRename: false },
+        messages: (room.messages || []).map(toPublicMessage),
+        pinnedMessageId: room.pinnedMessageId || null,
+        you: { anonName: session.anonName },
       });
       return;
     }
 
     if (msg.type === "message") {
-      const { messageType, content } = msg;
+      const { content, replyTo } = msg;
       if (!content || typeof content !== "string") return;
-
-      if (messageType === "image" && Buffer.byteLength(content, "utf8") > MAX_IMAGE_BYTES) {
-        send(ws, { type: "error", message: "Image too large (max ~1MB)" });
-        return;
-      }
-      if (messageType === "audio" && Buffer.byteLength(content, "utf8") > MAX_AUDIO_BYTES) {
-        send(ws, { type: "error", message: "Audio too large (max ~2MB)" });
+      if (Buffer.byteLength(content, "utf8") > MAX_TEXT_BYTES) {
+        send(ws, { type: "error", message: "Message too long" });
         return;
       }
 
-      const normalizedType =
-        messageType === "image" ? "image" : messageType === "audio" ? "audio" : "text";
+      let normalizedReplyTo = null;
+      if (replyTo && typeof replyTo.id === "string") {
+        const source = room.messages.find((m) => m.id === replyTo.id);
+        if (source) {
+          normalizedReplyTo = {
+            id: source.id,
+            anonName: source.anonName,
+            contentPreview: String(source.content || "").slice(0, 120),
+          };
+        }
+      }
 
       const entry = {
         id: crypto.randomUUID(),
         ts: now(),
         anonName: session.anonName,
-        senderRegistrationNo: session.registrationNo,
-        senderName: session.name,
-        messageType: normalizedType,
-        content,
+        messageType: "text",
+        content: content.slice(0, 1200),
+        replyTo: normalizedReplyTo,
+        reactions: {},
       };
 
       room.messages.push(entry);
       pruneMessages(room);
-      persistRoom(department, room);
+      persistRoom();
 
-      const publicMessage = {
-        id: entry.id,
-        ts: entry.ts,
-        anonName: entry.anonName,
-        messageType: entry.messageType,
-        content: entry.content,
-      };
-
-      broadcastToRoom(department, { type: "message", message: publicMessage });
+      broadcastToRoom(roomName, { type: "message", message: toPublicMessage(entry) });
+      room.typing[session.anonName] = false;
+      broadcastToRoom(roomName, { type: "typing", anonName: session.anonName, isTyping: false });
       return;
     }
 
-    if (msg.type === "rename-room") {
-      const { name } = msg;
-      if (!name || typeof name !== "string") return;
-      if (
-        room.ownerSessionId !== sessionId &&
-        room.ownerRegistrationNo !== session.registrationNo
-      ) {
-        return;
-      }
+    if (msg.type === "typing") {
+      const isTyping = Boolean(msg.isTyping);
+      const previous = Boolean(room.typing[session.anonName]);
+      if (previous === isTyping) return;
+      room.typing[session.anonName] = isTyping;
+      broadcastToRoom(roomName, { type: "typing", anonName: session.anonName, isTyping });
+      return;
+    }
 
-      room.name = name.slice(0, 40);
-      persistRoom(department, room);
-      broadcastToRoom(department, {
-        type: "room-renamed",
-        name: room.name,
-        by: session.anonName,
+    if (msg.type === "pin-message") {
+      const { messageId } = msg;
+      if (!messageId || typeof messageId !== "string") return;
+      const exists = room.messages.some((m) => m.id === messageId);
+      if (!exists) return;
+      room.pinnedMessageId = room.pinnedMessageId === messageId ? null : messageId;
+      persistRoom();
+      broadcastToRoom(roomName, {
+        type: "message-pinned",
+        messageId: room.pinnedMessageId,
+        pinnedBy: session.anonName,
       });
       return;
     }
 
-    if (msg.type === "admin-reveal") {
-      console.log("Admin reveal requested by", session.anonName, "in department", department);
-      if (!session.isAdmin) {
-        console.log("User is not admin");
-        return;
+    if (msg.type === "react-message") {
+      const { messageId, emoji } = msg;
+      if (!messageId || typeof messageId !== "string") return;
+      if (!emoji || typeof emoji !== "string") return;
+      const target = room.messages.find((m) => m.id === messageId);
+      if (!target) return;
+      if (!target.reactions || typeof target.reactions !== "object") {
+        target.reactions = {};
       }
-
-      const roomRegistry = room.anonRegistry || {};
-      const mappingByAnon = new Map(
-        Object.entries(roomRegistry).map(([anonName, info]) => [
-          anonName,
-          { anonName, registrationNo: info.registrationNo, name: info.name },
-        ])
-      );
-
-      for (const m of room.messages || []) {
-        if (!m.anonName || mappingByAnon.has(m.anonName)) continue;
-        if (m.senderRegistrationNo && m.senderName) {
-          mappingByAnon.set(m.anonName, {
-            anonName: m.anonName,
-            registrationNo: m.senderRegistrationNo,
-            name: m.senderName,
-          });
-        }
+      const users = Array.isArray(target.reactions[emoji]) ? target.reactions[emoji] : [];
+      const hasUser = users.includes(session.anonName);
+      target.reactions[emoji] = hasUser
+        ? users.filter((name) => name !== session.anonName)
+        : [...users, session.anonName];
+      if (target.reactions[emoji].length === 0) {
+        delete target.reactions[emoji];
       }
-
-      const mapping = Array.from(mappingByAnon.values());
-
-      console.log("Sending mapping with", mapping.length, "users");
-      send(ws, { type: "admin-mapping", mapping });
-      return;
+      persistRoom();
+      broadcastToRoom(roomName, {
+        type: "message-reaction",
+        messageId,
+        reactions: target.reactions,
+      });
     }
   });
 
   ws.on("close", () => {
     const session = sessions.get(sessionId);
     if (session) {
-      const department = session.department;
-      const set = roomClients.get(department);
+      const set = roomClients.get(session.roomName);
       if (set) set.delete(ws);
-      const active = activeSessions.get(session.registrationNo);
-      if (active) {
-        active.activeWs = Math.max(0, active.activeWs - 1);
-        active.lastSeen = now();
-      }
+      const room = getOrCreateRoom(session.roomName);
+      room.typing[session.anonName] = false;
+      broadcastToRoom(session.roomName, { type: "typing", anonName: session.anonName, isTyping: false });
     }
     wsToSession.delete(ws);
   });
 });
 
 setInterval(() => {
-  const cutoff = now();
-  for (const [reg, challenge] of authChallenges.entries()) {
-    if (challenge.expiresAt < cutoff) {
-      authChallenges.delete(reg);
-    }
-  }
-  for (const room of rooms.values()) {
+  for (const room of Object.values(storeCache.rooms)) {
     pruneMessages(room);
   }
   flushStore();
 }, 60 * 1000);
 
 app.get("/api/health", (req, res) => {
-  res.json({ ok: true, rooms: rooms.size, sessions: sessions.size });
+  res.json({ ok: true, rooms: Object.keys(storeCache.rooms).length, sessions: sessions.size });
 });
 
 server.listen(PORT, () => {
-  // eslint-disable-next-line no-console
   console.log(`ChatPe server listening on http://localhost:${PORT}`);
 });
